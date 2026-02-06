@@ -1,0 +1,6 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+ 	"name": "meganz-proxy",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-06-01",
+}
