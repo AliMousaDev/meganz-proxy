@@ -1,52 +1,41 @@
 import { Elysia } from "elysia";
 import { cors } from "@elysiajs/cors";
 import { CloudflareAdapter } from "elysia/adapter/cloudflare-worker";
+import aesjs from "aes-js";
 
 interface MegaStreamData {
   encryptedUrl: string;
-  aesKey: Buffer;
-  nonce: Buffer;
+  aesKey: Uint8Array;
+  nonce: Uint8Array;
   fileName: string;
   fileSize: number;
 }
 
-interface CacheEntry {
+interface CachedMegaInfo {
   data: MegaStreamData;
   timestamp: number;
 }
 
-// Simple in-memory cache (expires after 1 hour)
-const infoCache = new Map<string, CacheEntry>();
-const CACHE_TTL = 3600000; // 1 hour in ms
+// Cache for Mega API responses (5 min TTL)
+const CACHE_TTL = 5 * 60 * 1000;
+const megaCache = new Map<string, CachedMegaInfo>();
+
+// Request timeouts
+const MEGA_API_TIMEOUT = 8000; // 8 seconds for Mega API
+const STREAM_TIMEOUT = 25000; // 25 seconds for streaming (CF Worker limit is 30s on free tier)
 
 export default new Elysia({
   adapter: CloudflareAdapter,
 })
   .use(cors())
   .get("/", () => ({
-    message: "Mega Video Stream API - Enhanced Version",
-    version: "2.0",
+    message: "Mega Video Stream API (Optimized CF Worker)",
     endpoints: {
-      info: "/api/info?url=<base64_mega_url>",
-      stream: "/stream?url=<base64_mega_url>",
-      health: "/health",
+      info: "/api/info?url=<mega_url>",
+      stream: "/stream?url=<mega_url>",
     },
-    features: [
-      "Range requests support",
-      "Auto-retry on failures",
-      "Block-aligned decryption",
-      "Response caching",
-      "Optimized streaming"
-    ]
+    version: "2.0-optimized",
   }))
-  
-  // Health check endpoint
-  .get("/health", () => ({
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    cache_size: infoCache.size
-  }))
-  
   .get("/api/info", async ({ query, request }) => {
     const { url: megaUrl } = query;
 
@@ -59,21 +48,18 @@ export default new Elysia({
       const baseUrl = new URL(request.url).origin;
 
       return {
-        success: true,
         fileName: info.fileName,
         fileSize: info.fileSize,
-        fileSizeMB: (info.fileSize / (1024 * 1024)).toFixed(2),
         streamUrl: `${baseUrl}/stream?url=${encodeURIComponent(megaUrl)}`,
       };
-    } catch (error) {
-      console.error("Error in /api/info:", error);
+    } catch (e) {
+      console.error("Info error:", e);
       return { 
-        error: "Failed to fetch file info",
-        details: error instanceof Error ? error.message : "Unknown error"
+        error: (e as Error).message,
+        hint: "Try again in a few seconds. If the problem persists, the file may be deleted or the URL invalid."
       };
     }
   })
-  
   .get("/stream", async ({ query, request, set }) => {
     const { url: megaUrl } = query;
 
@@ -83,7 +69,10 @@ export default new Elysia({
     }
 
     try {
+      // Get file info with caching
       const info = await getMegaDownloadInfoCached(megaUrl);
+
+      // Handle Range Requests
       const range = request.headers.get("Range");
       let startByte = 0;
       let endByte = info.fileSize - 1;
@@ -94,154 +83,201 @@ export default new Elysia({
         endByte = parts[1] ? parseInt(parts[1], 10) : endByte;
       }
 
-      // ⭐ Align to AES block boundaries (16 bytes)
-      const alignedStart = Math.floor(startByte / 16) * 16;
-      const intraBlockOffset = startByte - alignedStart;
+      // Validate range
+      if (startByte >= info.fileSize || endByte >= info.fileSize || startByte > endByte) {
+        set.status = 416; // Range Not Satisfiable
+        return { error: "Invalid range" };
+      }
 
-      // Setup decryption
-      const crypto = await import("node:crypto");
-      const blockOffset = Math.floor(alignedStart / 16);
-      const counter = Buffer.alloc(16);
-      info.nonce.copy(counter, 0);
-      counter.writeBigUInt64BE(BigInt(blockOffset), 8);
+      // Limit chunk size to prevent memory issues (max 10MB per request)
+      const MAX_CHUNK_SIZE = 10 * 1024 * 1024;
+      if (endByte - startByte + 1 > MAX_CHUNK_SIZE) {
+        endByte = startByte + MAX_CHUNK_SIZE - 1;
+      }
 
-      const decipher = crypto.createDecipheriv(
-        "aes-128-ctr",
-        info.aesKey,
-        counter,
-      );
+      // Align to AES block size (16 bytes)
+      const blockAlignedStart = Math.floor(startByte / 16) * 16;
+      const intraBlockOffset = startByte - blockAlignedStart;
 
-      // ⭐ Enhanced streaming with retry logic and chunking
-      const readable = new ReadableStream({
-        async start(controller) {
-          let retryCount = 0;
-          const MAX_RETRIES = 3;
-          const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
-          let currentPosition = alignedStart;
-          let totalBytesRead = 0;
+      // Fetch encrypted data with timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), STREAM_TIMEOUT);
 
-          while (currentPosition <= endByte) {
+      try {
+        const encryptedResponse = await fetch(info.encryptedUrl, {
+          headers: { "Range": `bytes=${blockAlignedStart}-${endByte}` },
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!encryptedResponse.ok) {
+          throw new Error(`Mega server error: ${encryptedResponse.status}`);
+        }
+
+        if (!encryptedResponse.body) {
+          throw new Error("No response body from Mega");
+        }
+
+        // Prepare Web Crypto Key for CTR (Streaming)
+        const cryptoKey = await crypto.subtle.importKey(
+          "raw",
+          info.aesKey,
+          { name: "AES-CTR" },
+          false,
+          ["decrypt"]
+        );
+
+        // Optimized Transform Stream (Decrypt on the fly)
+        let currentBlockIndex = BigInt(blockAlignedStart / 16);
+        let isFirstChunk = true;
+        let buffer = new Uint8Array(0);
+
+        const transformer = new TransformStream({
+          async transform(chunk, controller) {
             try {
-              // Calculate chunk end
-              const chunkEnd = Math.min(currentPosition + CHUNK_SIZE - 1, endByte);
-              
-              const headers: Record<string, string> = {
-                "Range": `bytes=${currentPosition}-${chunkEnd}`
-              };
+              // Combine buffers efficiently
+              const newBuffer = new Uint8Array(buffer.length + chunk.length);
+              newBuffer.set(buffer);
+              newBuffer.set(chunk, buffer.length);
+              buffer = newBuffer;
 
-              // ⭐ Fetch with timeout
-              const encryptedResponse = await fetch(info.encryptedUrl, { 
-                headers,
-                signal: AbortSignal.timeout(30000) // 30 second timeout
-              });
+              // Process in 16-byte blocks
+              const processableLength = Math.floor(buffer.length / 16) * 16;
 
-              if (!encryptedResponse.ok) {
-                throw new Error(`Fetch failed with status: ${encryptedResponse.status}`);
-              }
+              if (processableLength > 0) {
+                const toDecrypt = buffer.slice(0, processableLength);
+                buffer = buffer.slice(processableLength);
 
-              if (!encryptedResponse.body) {
-                throw new Error("Response body is null");
-              }
+                // Create counter block
+                const counterBlock = new Uint8Array(16);
+                counterBlock.set(info.nonce, 0);
+                const view = new DataView(counterBlock.buffer);
+                view.setBigUint64(8, currentBlockIndex, false);
 
-              const reader = encryptedResponse.body.getReader();
-              let isFirstChunkOfRequest = true;
+                // Decrypt chunk
+                const decryptedBuffer = await crypto.subtle.decrypt(
+                  {
+                    name: "AES-CTR",
+                    counter: counterBlock,
+                    length: 64,
+                  },
+                  cryptoKey,
+                  toDecrypt
+                );
 
-              // Read stream
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
+                let decrypted = new Uint8Array(decryptedBuffer);
 
-                let decrypted = decipher.update(value);
-
-                // ⭐ Handle intra-block offset only on very first chunk
-                if (totalBytesRead === 0 && intraBlockOffset > 0) {
-                  decrypted = decrypted.subarray(intraBlockOffset);
+                // Handle first chunk offset
+                if (isFirstChunk && intraBlockOffset > 0) {
+                  decrypted = decrypted.slice(intraBlockOffset);
+                  isFirstChunk = false;
                 }
 
                 controller.enqueue(decrypted);
-                currentPosition += value.length;
-                totalBytesRead += decrypted.length;
+                currentBlockIndex += BigInt(processableLength / 16);
               }
-
-              // Reset retry count on successful chunk
-              retryCount = 0;
-
-            } catch (error) {
-              console.error(`Stream error at position ${currentPosition}:`, error);
-              retryCount++;
-              
-              if (retryCount >= MAX_RETRIES) {
-                console.error("Max retries reached, aborting stream");
-                controller.error(error);
-                return;
-              }
-
-              // ⭐ Exponential backoff
-              const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
-              console.log(`Retrying in ${backoffTime}ms... (attempt ${retryCount}/${MAX_RETRIES})`);
-              await new Promise(r => setTimeout(r, backoffTime));
+            } catch (err) {
+              console.error("Transform error:", err);
+              controller.error(err);
             }
-          }
-          
-          controller.close();
-        },
-      });
+          },
+          async flush(controller) {
+            try {
+              // Process any remaining bytes
+              if (buffer.length > 0) {
+                const counterBlock = new Uint8Array(16);
+                counterBlock.set(info.nonce, 0);
+                const view = new DataView(counterBlock.buffer);
+                view.setBigUint64(8, currentBlockIndex, false);
 
-      // ⭐ Enhanced response headers
-      set.headers["Content-Type"] = "video/mp4";
-      set.headers["Accept-Ranges"] = "bytes";
-      set.headers["Cache-Control"] = "public, max-age=3600";
-      set.headers["X-Content-Type-Options"] = "nosniff";
+                const decryptedBuffer = await crypto.subtle.decrypt(
+                  {
+                    name: "AES-CTR",
+                    counter: counterBlock,
+                    length: 64,
+                  },
+                  cryptoKey,
+                  buffer
+                );
 
-      if (range) {
-        set.status = 206; // Partial Content
-        set.headers["Content-Range"] = `bytes ${startByte}-${endByte}/${info.fileSize}`;
-        set.headers["Content-Length"] = String(endByte - startByte + 1);
-      } else {
-        set.headers["Content-Length"] = String(info.fileSize);
+                let decrypted = new Uint8Array(decryptedBuffer);
+
+                if (isFirstChunk && intraBlockOffset > 0) {
+                  decrypted = decrypted.slice(intraBlockOffset);
+                }
+
+                controller.enqueue(decrypted);
+              }
+            } catch (err) {
+              console.error("Flush error:", err);
+              controller.error(err);
+            }
+          },
+        });
+
+        // Set headers
+        set.headers["Content-Type"] = "video/mp4";
+        set.headers["Accept-Ranges"] = "bytes";
+        set.headers["Cache-Control"] = "public, max-age=3600";
+        set.headers["Connection"] = "keep-alive";
+
+        if (range) {
+          set.status = 206;
+          set.headers["Content-Range"] = `bytes ${startByte}-${endByte}/${info.fileSize}`;
+          set.headers["Content-Length"] = String(endByte - startByte + 1);
+        } else {
+          set.headers["Content-Length"] = String(info.fileSize);
+        }
+
+        return new Response(encryptedResponse.body.pipeThrough(transformer), {
+          // @ts-expect-error - Elysia typing issue
+          headers: set.headers,
+          // @ts-expect-error - Elysia typing issue
+          status: set.status,
+        });
+      } catch (fetchError) {
+        clearTimeout(timeoutId);
+        
+        if ((fetchError as Error).name === 'AbortError') {
+          throw new Error("Request timeout - file may be too large or connection is slow");
+        }
+        throw fetchError;
       }
-
-      // @ts-expect-error - Elysia typing issue
-      return new Response(readable, { headers: set.headers });
-      
-    } catch (error) {
-      console.error("Error in /stream:", error);
-      set.status = 500;
+    } catch (e) {
+      console.error("Stream error:", e);
+      set.status = 503;
       return { 
-        error: "Streaming failed",
-        details: error instanceof Error ? error.message : "Unknown error"
+        error: (e as Error).message,
+        hint: "Service temporarily unavailable. Please try again.",
+        retryAfter: 5
       };
     }
   })
   .compile();
 
-// ⭐ Cached version of getMegaDownloadInfo
+// Cached version of getMegaDownloadInfo
 async function getMegaDownloadInfoCached(megaUrl: string): Promise<MegaStreamData> {
-  // Check cache
-  const cached = infoCache.get(megaUrl);
+  // Check cache first
+  const cached = megaCache.get(megaUrl);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    console.log("Cache hit for:", megaUrl.substring(0, 20) + "...");
     return cached.data;
   }
 
   // Fetch fresh data
-  console.log("Cache miss, fetching:", megaUrl.substring(0, 20) + "...");
   const data = await getMegaDownloadInfo(megaUrl);
   
   // Store in cache
-  infoCache.set(megaUrl, {
+  megaCache.set(megaUrl, {
     data,
-    timestamp: Date.now()
+    timestamp: Date.now(),
   });
 
-  // Clean old cache entries (simple cleanup)
-  if (infoCache.size > 100) {
-    const now = Date.now();
-    for (const [key, entry] of infoCache.entries()) {
-      if (now - entry.timestamp > CACHE_TTL) {
-        infoCache.delete(key);
-      }
-    }
+  // Cleanup old cache entries (keep cache size manageable)
+  if (megaCache.size > 100) {
+    const entries = Array.from(megaCache.entries());
+    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+    megaCache.delete(entries[0][0]);
   }
 
   return data;
@@ -256,83 +292,129 @@ async function getMegaDownloadInfo(megaUrl: string): Promise<MegaStreamData> {
       throw new Error("Invalid Mega URL format");
     }
 
-    const [, handle, key] = match as [unknown, string, string];
+    const [, handle, key] = match;
 
-    const response = await fetch("https://g.api.mega.co.nz/cs?id=0", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify([{ a: "g", g: 1, ssl: 0, p: handle }]),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Mega API error: ${response.status}`);
+    if (!handle || !key) {
+      throw new Error("Missing handle or key in URL");
     }
 
-    const data = (await response.json()) as {
-      at: string;
-      g: string;
-      s: number;
-    }[];
+    // Add timeout to Mega API request
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), MEGA_API_TIMEOUT);
 
-    if (!data || !data[0]) {
-      throw new Error("Invalid response from Mega API");
+    try {
+      const response = await fetch("https://g.api.mega.co.nz/cs?id=0", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify([{ a: "g", g: 1, ssl: 0, p: handle }]),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`Mega API error: ${response.status}`);
+      }
+
+      const data = (await response.json()) as Array<{
+        at: string;
+        g: string;
+        s: number;
+      }>;
+
+      if (!data[0]) {
+        throw new Error("File not found or has been deleted");
+      }
+
+      const megaData = data[0];
+
+      if (!megaData.g || !megaData.at || !megaData.s) {
+        throw new Error("Invalid response from Mega API");
+      }
+
+      const nodeKey = base64UrlToUint8Array(key);
+      const { aesKey, nonce } = unpackNodeKey(nodeKey);
+
+      const fileName = decryptAttributes(megaData.at, aesKey);
+
+      return {
+        encryptedUrl: megaData.g,
+        aesKey,
+        nonce,
+        fileName,
+        fileSize: megaData.s,
+      };
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      
+      if ((fetchError as Error).name === 'AbortError') {
+        throw new Error("Mega API timeout - service may be slow or unavailable");
+      }
+      throw fetchError;
     }
-
-    const megaData = data[0];
-
-    const nodeKey = base64UrlDecode(key);
-    const { aesKey, nonce } = unpackNodeKey(nodeKey);
-    const fileName = await decryptAttributes(megaData.at, aesKey);
-
-    return {
-      encryptedUrl: megaData.g,
-      aesKey,
-      nonce,
-      fileName,
-      fileSize: megaData.s,
-    };
-  } catch (error) {
-    console.error("Error in getMegaDownloadInfo:", error);
-    throw error;
+  } catch (e) {
+    throw new Error(`Failed to get Mega info: ${(e as Error).message}`);
   }
 }
 
-function base64UrlDecode(str: string): Buffer {
-  let base64 = str.replace(/-/g, "+").replace(/_/g, "/");
-  while (base64.length % 4) base64 += "=";
-  return Buffer.from(base64, "base64");
+function base64UrlToUint8Array(str: string): Uint8Array {
+  try {
+    const base64 = str.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(
+      base64.length + ((4 - (base64.length % 4)) % 4),
+      "="
+    );
+    const binaryString = atob(padded);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
+  } catch (e) {
+    throw new Error("Invalid base64 encoding in URL");
+  }
 }
 
-function unpackNodeKey(nodeKey: Buffer) {
-  const aesKey = Buffer.alloc(16);
+function unpackNodeKey(nodeKey: Uint8Array) {
+  if (nodeKey.length < 32) {
+    throw new Error("Invalid node key length");
+  }
+
+  const view = new DataView(nodeKey.buffer);
+  const aesKey = new Uint8Array(16);
+  const aesView = new DataView(aesKey.buffer);
+
   for (let i = 0; i < 4; i++) {
     const offset = i * 4;
-    aesKey.writeUInt32BE(
-      nodeKey.readUInt32BE(offset) ^ nodeKey.readUInt32BE(offset + 16),
-      offset,
-    );
+    const n1 = view.getUint32(offset, false);
+    const n2 = view.getUint32(offset + 16, false);
+    aesView.setUint32(offset, n1 ^ n2, false);
   }
-  const nonce = nodeKey.subarray(16, 24);
+
+  const nonce = nodeKey.slice(16, 24);
   return { aesKey, nonce };
 }
 
-async function decryptAttributes(
-  encryptedAttrs: string,
-  key: Buffer,
-): Promise<string> {
-  const crypto = await import("node:crypto");
-  const ciphertext = base64UrlDecode(encryptedAttrs);
-  const iv = Buffer.alloc(16, 0);
+function decryptAttributes(encryptedAttrs: string, key: Uint8Array): string {
+  try {
+    const ciphertext = base64UrlToUint8Array(encryptedAttrs);
+    const iv = new Uint8Array(16).fill(0);
 
-  const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
-  decipher.setAutoPadding(false);
+    // @ts-ignore - aes-js types might mismatch
+    const aesCbc = new aesjs.ModeOfOperation.cbc(key, iv);
+    const decryptedBytes = aesCbc.decrypt(ciphertext);
 
-  const decrypted = Buffer.concat([
-    decipher.update(ciphertext),
-    decipher.final(),
-  ]);
-  const str = decrypted.toString("utf8").replace(/\0+$/, "");
+    // Remove padding
+    let end = decryptedBytes.length;
+    while (end > 0 && decryptedBytes[end - 1] === 0) {
+      end--;
+    }
 
-  const json = JSON.parse(str.substring(4));
-  return json.n || "download";
+    const jsonStr = new TextDecoder().decode(decryptedBytes.slice(0, end));
+    const json = JSON.parse(jsonStr.substring(4));
+    
+    return json.n || "download.mp4";
+  } catch (e) {
+    throw new Error("Failed to decrypt file attributes");
+  }
 }
