@@ -18,10 +18,10 @@ export default new Elysia({
   .use(cors())
 
   .get("/", () => ({
-    message: "Mega Video Stream API (Optimized)",
+    message: "Mega Video Stream API (Optimized + Base64 Support)",
     endpoints: {
-      info: "/api/info?url=<mega_url>",
-      stream: "/stream?url=<mega_url>",
+      info: "/api/info?url=<mega_url_or_base64>",
+      stream: "/stream?url=<mega_url_or_base64>",
     },
   }))
 
@@ -31,7 +31,7 @@ export default new Elysia({
 
     const info = await getMegaDownloadInfoCached(megaUrl, request);
 
-    // warm-up للكاش
+    // warm-up
     getMegaDownloadInfoCached(megaUrl, request).catch(() => {});
 
     return {
@@ -58,14 +58,13 @@ export default new Elysia({
 
     if (range) {
       const [s, e] = range.replace("bytes=", "").split("-");
-      start = parseInt(s);
-      if (e) end = parseInt(e);
+      start = parseInt(s, 10);
+      if (e) end = parseInt(e, 10);
     } else {
       // preload أول 256KB
       end = Math.min(end, 256 * 1024);
     }
 
-    // AES block alignment
     const alignedStart = Math.floor(start / 16) * 16;
     const offset = start - alignedStart;
 
@@ -73,18 +72,22 @@ export default new Elysia({
       headers: { Range: `bytes=${alignedStart}-${end}` },
     });
 
-    if (!res.body) throw new Error("No response body");
+    if (!res.body) throw new Error("No response body from Mega");
 
     let blockIndex = BigInt(alignedStart / 16);
     let first = true;
     let buffer = new Uint8Array(0);
 
-    const transformer = new TransformStream({
+    const transformer = new TransformStream<Uint8Array, Uint8Array>({
       async transform(chunk, controller) {
-        buffer =
-          buffer.length === 0
-            ? chunk
-            : Uint8Array.from([...buffer, ...chunk]);
+        if (buffer.length === 0) {
+          buffer = chunk;
+        } else {
+          const tmp = new Uint8Array(buffer.length + chunk.length);
+          tmp.set(buffer);
+          tmp.set(chunk, buffer.length);
+          buffer = tmp;
+        }
 
         const size = Math.floor(buffer.length / 16) * 16;
         if (!size) return;
@@ -138,16 +141,32 @@ export default new Elysia({
 
 /* ===================== HELPERS ===================== */
 
+function safeDecodeMegaUrl(input: string): string {
+  let url = input;
+
+  // جرّب Base64
+  try {
+    const decoded = atob(input);
+    if (decoded.includes("mega.nz")) {
+      url = decoded;
+    }
+  } catch {
+    // مش Base64 → تجاهل
+  }
+
+  return decodeURIComponent(url);
+}
+
 async function getMegaDownloadInfoCached(
   megaUrl: string,
   request: Request,
 ): Promise<MegaStreamData> {
   const cache = caches.default;
-  const key = new Request(
+  const cacheKey = new Request(
     `${new URL(request.url).origin}/__mega__?u=${encodeURIComponent(megaUrl)}`,
   );
 
-  const cached = await cache.match(key);
+  const cached = await cache.match(cacheKey);
   if (cached) {
     const data = await cached.json();
     data.cryptoKey = await crypto.subtle.importKey(
@@ -163,7 +182,7 @@ async function getMegaDownloadInfoCached(
   const info = await getMegaDownloadInfo(megaUrl);
 
   await cache.put(
-    key,
+    cacheKey,
     new Response(JSON.stringify(info), {
       headers: { "Cache-Control": "public, max-age=900" },
     }),
@@ -173,8 +192,11 @@ async function getMegaDownloadInfoCached(
 }
 
 async function getMegaDownloadInfo(megaUrl: string): Promise<MegaStreamData> {
-  const decodedUrl = decodeURIComponent(megaUrl);
-  const match = decodedUrl.match(/mega\.nz\/(?:file\/|#!)([^#!]+)[#!](.+)/);
+  const decodedUrl = safeDecodeMegaUrl(megaUrl);
+
+  const match = decodedUrl.match(
+    /mega\.nz\/(?:file\/|#!)([^#!]+)[#!]([^?]+)/,
+  );
   if (!match) throw new Error("Invalid Mega URL");
 
   const [, handle, key] = match;
@@ -209,7 +231,7 @@ async function getMegaDownloadInfo(megaUrl: string): Promise<MegaStreamData> {
   };
 }
 
-function base64UrlToUint8Array(str: string) {
+function base64UrlToUint8Array(str: string): Uint8Array {
   str = str.replace(/-/g, "+").replace(/_/g, "/");
   while (str.length % 4) str += "=";
   return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
@@ -218,22 +240,23 @@ function base64UrlToUint8Array(str: string) {
 function unpackNodeKey(nodeKey: Uint8Array) {
   const view = new DataView(nodeKey.buffer);
   const aesKey = new Uint8Array(16);
+
   for (let i = 0; i < 4; i++) {
-    aesKey.set(
-      new Uint8Array(
-        new Uint32Array([
-          view.getUint32(i * 4) ^ view.getUint32(i * 4 + 16),
-        ]).buffer,
-      ),
-      i * 4,
-    );
+    const n1 = view.getUint32(i * 4, false);
+    const n2 = view.getUint32(i * 4 + 16, false);
+    new DataView(aesKey.buffer).setUint32(i * 4, n1 ^ n2, false);
   }
+
   return { aesKey, nonce: nodeKey.slice(16, 24) };
 }
 
-function decryptAttributes(at: string, key: Uint8Array) {
+function decryptAttributes(at: string, key: Uint8Array): string {
   const aes = new aesjs.ModeOfOperation.cbc(key, new Uint8Array(16));
   const decrypted = aes.decrypt(base64UrlToUint8Array(at));
-  const json = new TextDecoder().decode(decrypted).replace(/\0+$/, "");
+
+  const json = new TextDecoder()
+    .decode(decrypted)
+    .replace(/\0+$/, "");
+
   return JSON.parse(json.slice(4)).n ?? "video.mp4";
 }
