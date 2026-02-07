@@ -12,27 +12,28 @@ interface MegaStreamData {
   fileSize: number;
 }
 
+interface CachedMegaData {
+  encryptedUrl: string;
+  aesKey: number[];
+  nonce: number[];
+  fileName: string;
+  fileSize: number;
+}
+
 export default new Elysia({
   adapter: CloudflareAdapter,
 })
   .use(cors())
 
   .get("/", () => ({
-    message: "Mega Video Stream API (Optimized + Base64 Support)",
-    endpoints: {
-      info: "/api/info?url=<mega_url_or_base64>",
-      stream: "/stream?url=<mega_url_or_base64>",
-    },
+    message: "Mega Video Stream API (FINAL FIXED)",
   }))
 
   .get("/api/info", async ({ query, request }) => {
     const megaUrl = query.url;
-    if (!megaUrl) return { error: "Missing url parameter" };
+    if (!megaUrl) return { error: "Missing url" };
 
-    const info = await getMegaDownloadInfoCached(megaUrl, request);
-
-    // warm-up
-    getMegaDownloadInfoCached(megaUrl, request).catch(() => {});
+    const info = await getMegaInfoCached(megaUrl, request);
 
     return {
       fileName: info.fileName,
@@ -47,10 +48,10 @@ export default new Elysia({
     const megaUrl = query.url;
     if (!megaUrl) {
       set.status = 400;
-      return { error: "Missing url parameter" };
+      return { error: "Missing url" };
     }
 
-    const info = await getMegaDownloadInfoCached(megaUrl, request);
+    const info = await getMegaInfoCached(megaUrl, request);
 
     const range = request.headers.get("Range");
     let start = 0;
@@ -61,7 +62,6 @@ export default new Elysia({
       start = parseInt(s, 10);
       if (e) end = parseInt(e, 10);
     } else {
-      // preload أول 256KB
       end = Math.min(end, 256 * 1024);
     }
 
@@ -72,7 +72,7 @@ export default new Elysia({
       headers: { Range: `bytes=${alignedStart}-${end}` },
     });
 
-    if (!res.body) throw new Error("No response body from Mega");
+    if (!res.body) throw new Error("No response body");
 
     let blockIndex = BigInt(alignedStart / 16);
     let first = true;
@@ -80,14 +80,10 @@ export default new Elysia({
 
     const transformer = new TransformStream<Uint8Array, Uint8Array>({
       async transform(chunk, controller) {
-        if (buffer.length === 0) {
-          buffer = chunk;
-        } else {
-          const tmp = new Uint8Array(buffer.length + chunk.length);
-          tmp.set(buffer);
-          tmp.set(chunk, buffer.length);
-          buffer = tmp;
-        }
+        const tmp = new Uint8Array(buffer.length + chunk.length);
+        tmp.set(buffer);
+        tmp.set(chunk, buffer.length);
+        buffer = tmp;
 
         const size = Math.floor(buffer.length / 16) * 16;
         if (!size) return;
@@ -139,25 +135,17 @@ export default new Elysia({
 
   .compile();
 
-/* ===================== HELPERS ===================== */
+/* ================= HELPERS ================= */
 
 function safeDecodeMegaUrl(input: string): string {
-  let url = input;
-
-  // جرّب Base64
   try {
     const decoded = atob(input);
-    if (decoded.includes("mega.nz")) {
-      url = decoded;
-    }
-  } catch {
-    // مش Base64 → تجاهل
-  }
-
-  return decodeURIComponent(url);
+    if (decoded.includes("mega.nz")) return decoded;
+  } catch {}
+  return decodeURIComponent(input);
 }
 
-async function getMegaDownloadInfoCached(
+async function getMegaInfoCached(
   megaUrl: string,
   request: Request,
 ): Promise<MegaStreamData> {
@@ -168,22 +156,42 @@ async function getMegaDownloadInfoCached(
 
   const cached = await cache.match(cacheKey);
   if (cached) {
-    const data = await cached.json();
-    data.cryptoKey = await crypto.subtle.importKey(
+    const data = (await cached.json()) as CachedMegaData;
+
+    const aesKey = new Uint8Array(data.aesKey);
+    const nonce = new Uint8Array(data.nonce);
+
+    const cryptoKey = await crypto.subtle.importKey(
       "raw",
-      data.aesKey,
+      aesKey.buffer,
       { name: "AES-CTR" },
       false,
       ["decrypt"],
     );
-    return data;
+
+    return {
+      encryptedUrl: data.encryptedUrl,
+      aesKey,
+      nonce,
+      cryptoKey,
+      fileName: data.fileName,
+      fileSize: data.fileSize,
+    };
   }
 
-  const info = await getMegaDownloadInfo(megaUrl);
+  const info = await getMegaInfo(megaUrl);
+
+  const toCache: CachedMegaData = {
+    encryptedUrl: info.encryptedUrl,
+    aesKey: Array.from(info.aesKey),
+    nonce: Array.from(info.nonce),
+    fileName: info.fileName,
+    fileSize: info.fileSize,
+  };
 
   await cache.put(
     cacheKey,
-    new Response(JSON.stringify(info), {
+    new Response(JSON.stringify(toCache), {
       headers: { "Cache-Control": "public, max-age=900" },
     }),
   );
@@ -191,7 +199,7 @@ async function getMegaDownloadInfoCached(
   return info;
 }
 
-async function getMegaDownloadInfo(megaUrl: string): Promise<MegaStreamData> {
+async function getMegaInfo(megaUrl: string): Promise<MegaStreamData> {
   const decodedUrl = safeDecodeMegaUrl(megaUrl);
 
   const match = decodedUrl.match(
@@ -204,7 +212,7 @@ async function getMegaDownloadInfo(megaUrl: string): Promise<MegaStreamData> {
   const res = await fetch("https://g.api.mega.co.nz/cs?id=0", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify([{ a: "g", g: 1, ssl: 0, p: handle }]),
+    body: JSON.stringify([{ a: "g", g: 1, p: handle }]),
   });
 
   const data = await res.json();
@@ -215,7 +223,7 @@ async function getMegaDownloadInfo(megaUrl: string): Promise<MegaStreamData> {
 
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
-    aesKey,
+    aesKey.buffer,
     { name: "AES-CTR" },
     false,
     ["decrypt"],
@@ -253,10 +261,6 @@ function unpackNodeKey(nodeKey: Uint8Array) {
 function decryptAttributes(at: string, key: Uint8Array): string {
   const aes = new aesjs.ModeOfOperation.cbc(key, new Uint8Array(16));
   const decrypted = aes.decrypt(base64UrlToUint8Array(at));
-
-  const json = new TextDecoder()
-    .decode(decrypted)
-    .replace(/\0+$/, "");
-
+  const json = new TextDecoder().decode(decrypted).replace(/\0+$/, "");
   return JSON.parse(json.slice(4)).n ?? "video.mp4";
 }
